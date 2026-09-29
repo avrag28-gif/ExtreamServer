@@ -1,0 +1,137 @@
+name: Roblox Studio Remote - ngrok
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_minutes:
+        description: "Keep the remote Windows session alive"
+        required: true
+        default: "330"
+        type: string
+
+concurrency:
+  group: roblox-remote-ngrok
+  cancel-in-progress: true
+
+jobs:
+  remote:
+    runs-on: [self-hosted, windows, x64, gpu]
+    timeout-minutes: 360
+
+    steps:
+      - name: Verify Windows GPU
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "NVIDIA" }
+          if (-not $gpu) { throw "No NVIDIA GPU detected on the self-hosted runner." }
+          $gpu | Select-Object Name,DriverVersion,AdapterRAM | Format-List
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi }
+
+      - name: Configure Windows performance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powercfg /setactive SCHEME_MIN
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name VisualFXSetting -Type DWord -Value 2 -Force
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Type DWord -Value 0
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Type DWord -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+      - name: Create dedicated RDP account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Missing GitHub Secret: RDP_PASSWORD" }
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name "RobloxRemote" -ErrorAction SilentlyContinue
+          if ($existing) {
+            Set-LocalUser -Name "RobloxRemote" -Password $secure
+          } else {
+            New-LocalUser -Name "RobloxRemote" -Password $secure -FullName "Roblox Remote Session" -Description "Dedicated RDP account for Roblox Studio remote access" -PasswordNeverExpires -UserMayNotChangePassword
+          }
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RobloxRemote" -ErrorAction SilentlyContinue
+
+      - name: Install ngrok
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
+            winget install --id Ngrok.Ngrok -e --accept-source-agreements --accept-package-agreements
+          }
+          $ngrok = Get-Command ngrok -ErrorAction SilentlyContinue
+          if (-not $ngrok) {
+            $candidate = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter "ngrok.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidate) { $candidate.Directory.FullName | Out-File "$env:GITHUB_PATH" -Append }
+          }
+          if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) { throw "ngrok executable was not found after installation." }
+
+      - name: Configure ngrok authentication
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) { throw "Missing GitHub Secret: NGROK_AUTHTOKEN" }
+          ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
+
+      - name: Start ngrok TCP tunnel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput $log -RedirectStandardError $log -WindowStyle Hidden
+          $deadline = (Get-Date).AddSeconds(30)
+          $endpoint = $null
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            try {
+              $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 3
+              $endpoint = $tunnels.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+              if ($endpoint) { break }
+            } catch {}
+          }
+          if (-not $endpoint) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "ngrok TCP tunnel was not established."
+          }
+          Write-Host "=============================================="
+          Write-Host "RDP ENDPOINT: $($endpoint.public_url)"
+          Write-Host "RDP USER: RobloxRemote"
+          Write-Host "RDP PASSWORD: GitHub Secret RDP_PASSWORD"
+          Write-Host "=============================================="
+
+      - name: Launch Roblox Studio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $studio = Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Filter "RobloxStudioBeta.exe" -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $studio) {
+            $installer = Join-Path $env:TEMP "RobloxStudioLauncherBeta.exe"
+            Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioLauncherBeta.exe" -OutFile $installer
+            Start-Process -FilePath $installer -ArgumentList "-install" -Wait
+            $studio = Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Filter "RobloxStudioBeta.exe" -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          }
+          if (-not $studio) { throw "Roblox Studio executable was not found." }
+          Start-Process -FilePath $studio.FullName
+          Write-Host "Roblox Studio launched: $($studio.FullName)"
+
+      - name: Keep remote workstation alive
+        shell: pwsh
+        env:
+          KEEP_ALIVE_MINUTES: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $minutes = 330
+          if ($env:KEEP_ALIVE_MINUTES -match '^[0-9]+$') { $minutes = [int]$env:KEEP_ALIVE_MINUTES }
+          $minutes = [Math]::Min([Math]::Max($minutes, 1), 330)
+          Write-Host "Remote workstation will remain online for $minutes minutes."
+          Start-Sleep -Seconds ($minutes * 60)
