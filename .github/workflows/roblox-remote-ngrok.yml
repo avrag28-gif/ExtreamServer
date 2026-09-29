@@ -88,8 +88,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
-          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput $log -RedirectStandardError $log -WindowStyle Hidden
+          $stdout = Join-Path $env:RUNNER_TEMP "ngrok.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "ngrok.stderr.log"
+          Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
+          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden
           $deadline = (Get-Date).AddSeconds(30)
           $endpoint = $null
           while ((Get-Date) -lt $deadline) {
@@ -101,7 +103,8 @@ jobs:
             } catch {}
           }
           if (-not $endpoint) {
-            if (Test-Path $log) { Get-Content $log }
+            if (Test-Path $stdout) { Get-Content $stdout }
+            if (Test-Path $stderr) { Get-Content $stderr }
             throw "ngrok TCP tunnel was not established."
           }
           Write-Host "=============================================="
