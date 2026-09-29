@@ -1,0 +1,96 @@
+name: Roblox Studio Extreme
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner target"
+        required: true
+        default: "gpu"
+        type: choice
+        options:
+          - gpu
+          - self-hosted
+
+jobs:
+  diagnostics:
+    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'windows-2025' }}
+    timeout-minutes: 15
+    steps:
+      - name: System diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "=== OS ==="
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber
+          Write-Host "=== CPU ==="
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
+          Write-Host "=== RAM ==="
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+          Write-Host "=== GPU ==="
+          Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Host "nvidia-smi not available." }
+          Write-Host "=== DISK ==="
+          Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter,FileSystem,SizeRemaining,Size
+
+  self_hosted_check:
+    if: ${{ inputs.runner == 'self-hosted' }}
+    runs-on: [self-hosted, windows, x64, gpu]
+    timeout-minutes: 10
+    steps:
+      - name: Verify GPU workstation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA|AMD|Intel' }
+          if (-not $gpu) { throw "No GPU detected." }
+          $gpu | Format-List Name,DriverVersion,AdapterRAM
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi }
+
+  prepare_windows:
+    needs: [diagnostics]
+    if: ${{ inputs.runner == 'self-hosted' }}
+    runs-on: [self-hosted, windows, x64, gpu]
+    timeout-minutes: 10
+    steps:
+      - name: Apply reversible performance settings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          powercfg /setactive SCHEME_MIN
+          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -Type DWord -Value 2 -Force
+          Write-Host "Performance profile applied."
+
+  studio:
+    needs: [diagnostics, prepare_windows]
+    if: ${{ always() && (needs.diagnostics.result == 'success') && (inputs.runner == 'gpu' || needs.prepare_windows.result == 'success') }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'windows-2025' }}
+    timeout-minutes: 30
+    steps:
+      - name: Download official Roblox Studio installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://setup.rbxcdn.com/RobloxStudioLauncherBeta.exe'
+          $out = Join-Path $env:TEMP 'RobloxStudioLauncherBeta.exe'
+          Invoke-WebRequest -Uri $url -OutFile $out
+          if (!(Test-Path $out)) { throw 'Roblox Studio installer was not downloaded.' }
+
+      - name: Install Roblox Studio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP 'RobloxStudioLauncherBeta.exe'
+          Start-Process -FilePath $installer -ArgumentList '-install' -Wait
+          Write-Host "Studio installation command completed."
+
+      - name: GPU verification
+        shell: pwsh
+        run: |
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Warning 'No NVIDIA SMI tool detected.' }
+
+      - name: Final resource snapshot
+        shell: pwsh
+        run: |
+          Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,Id,CPU,WorkingSet64
+          Get-Volume C | Select-Object DriveLetter,SizeRemaining,Size
