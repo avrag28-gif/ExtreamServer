@@ -11,16 +11,28 @@ on:
         options:
           - gpu
           - self-hosted
+      larger_runner_label:
+        description: "GitHub larger-runner label (GPU mode)"
+        required: true
+        default: "REPLACE_WITH_YOUR_GPU_RUNNER_LABEL"
+        type: string
+
+concurrency:
+  group: roblox-studio-extreme
+  cancel-in-progress: true
+
+env:
+  STUDIO_INSTALLER: "$env:TEMP\RobloxStudioLauncherBeta.exe"
 
 jobs:
   diagnostics:
-    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'windows-2025' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","windows","x64","gpu"]') || inputs.larger_runner_label }}
     timeout-minutes: 15
     steps:
       - name: System diagnostics
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
           Write-Host "=== OS ==="
           Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber
           Write-Host "=== CPU ==="
@@ -28,43 +40,45 @@ jobs:
           Write-Host "=== RAM ==="
           Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory
           Write-Host "=== GPU ==="
-          Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM
-          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Host "nvidia-smi not available." }
+          $gpus = Get-CimInstance Win32_VideoController
+          $gpus | Select-Object Name,DriverVersion,AdapterRAM | Format-Table -AutoSize
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+            nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,utilization.gpu --format=csv
+          } else {
+            Write-Warning "nvidia-smi not available."
+          }
           Write-Host "=== DISK ==="
           Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter,FileSystem,SizeRemaining,Size
 
-  self_hosted_check:
-    if: ${{ inputs.runner == 'self-hosted' }}
-    runs-on: [self-hosted, windows, x64, gpu]
-    timeout-minutes: 10
-    steps:
-      - name: Verify GPU workstation
+      - name: Require NVIDIA GPU
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA|AMD|Intel' }
-          if (-not $gpu) { throw "No GPU detected." }
-          $gpu | Format-List Name,DriverVersion,AdapterRAM
-          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi }
+          $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }
+          if (-not $gpu) {
+            throw "GPU mode requires an NVIDIA GPU. The selected runner did not expose one."
+          }
+          if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+            throw "NVIDIA GPU detected but nvidia-smi is unavailable."
+          }
+          nvidia-smi
 
   prepare_windows:
-    needs: [diagnostics]
-    if: ${{ inputs.runner == 'self-hosted' }}
-    runs-on: [self-hosted, windows, x64, gpu]
+    needs: diagnostics
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","windows","x64","gpu"]') || inputs.larger_runner_label }}
     timeout-minutes: 10
     steps:
       - name: Apply reversible performance settings
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
           powercfg /setactive SCHEME_MIN
           Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -Type DWord -Value 2 -Force
           Write-Host "Performance profile applied."
 
   studio:
     needs: [diagnostics, prepare_windows]
-    if: ${{ always() && (needs.diagnostics.result == 'success') && (inputs.runner == 'gpu' || needs.prepare_windows.result == 'success') }}
-    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'windows-2025' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","windows","x64","gpu"]') || inputs.larger_runner_label }}
     timeout-minutes: 30
     steps:
       - name: Download official Roblox Studio installer
@@ -75,6 +89,7 @@ jobs:
           $out = Join-Path $env:TEMP 'RobloxStudioLauncherBeta.exe'
           Invoke-WebRequest -Uri $url -OutFile $out
           if (!(Test-Path $out)) { throw 'Roblox Studio installer was not downloaded.' }
+          Unblock-File -Path $out -ErrorAction SilentlyContinue
 
       - name: Install Roblox Studio
         shell: pwsh
@@ -82,15 +97,29 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $installer = Join-Path $env:TEMP 'RobloxStudioLauncherBeta.exe'
           Start-Process -FilePath $installer -ArgumentList '-install' -Wait
-          Write-Host "Studio installation command completed."
+          Write-Host "Studio installation completed."
 
-      - name: GPU verification
+      - name: Verify Roblox Studio executable
         shell: pwsh
         run: |
-          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Warning 'No NVIDIA SMI tool detected.' }
+          $candidates = @(
+            "$env:LOCALAPPDATA\Roblox\Versions\version-*\RobloxStudioBeta.exe",
+            "$env:ProgramFiles\Roblox\Versions\version-*\RobloxStudioBeta.exe"
+          )
+          $studio = Get-ChildItem -Path $candidates -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $studio) {
+            throw "RobloxStudioBeta.exe was not found after installation."
+          }
+          Write-Host "Studio: $($studio.FullName)"
+          $studio | Select-Object FullName,Length,LastWriteTime
 
-      - name: Final resource snapshot
+      - name: Final GPU and resource snapshot
         shell: pwsh
         run: |
-          Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,Id,CPU,WorkingSet64
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+            nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,utilization.gpu --format=csv
+          }
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory
           Get-Volume C | Select-Object DriveLetter,SizeRemaining,Size
+          Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,Id,CPU,WorkingSet64
